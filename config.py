@@ -9,6 +9,7 @@ default values when environment variables are not set.
 import os
 from dotenv import load_dotenv
 import logging
+import math
 
 # 配置日志
 logging.basicConfig(
@@ -28,11 +29,17 @@ SEARXNG_BASE_PATH = os.getenv("SEARXNG_BASE_PATH", "/search")
 SEARXNG_API_BASE = f"http://{SEARXNG_HOST}:{SEARXNG_PORT}{SEARXNG_BASE_PATH}"
 
 # API 服务配置
-API_HOST = os.getenv("API_HOST", "0.0.0.0")
+API_HOST = os.getenv("API_HOST", "127.0.0.1")
 API_PORT = int(os.getenv("API_PORT", "3000"))
 
 # 爬虫配置
 DEFAULT_SEARCH_LIMIT = int(os.getenv("DEFAULT_SEARCH_LIMIT", "10"))
+SEARCH_TIMEOUT_SECONDS = float(os.getenv("SEARCH_TIMEOUT_SECONDS", "15"))
+CRAWL_TIMEOUT_SECONDS = float(os.getenv("CRAWL_TIMEOUT_SECONDS", "90"))
+if not 1 <= DEFAULT_SEARCH_LIMIT <= 20:
+    raise ValueError("DEFAULT_SEARCH_LIMIT 必须在 1 到 20 之间")
+if any(not math.isfinite(value) or value <= 0 for value in (SEARCH_TIMEOUT_SECONDS, CRAWL_TIMEOUT_SECONDS)):
+    raise ValueError("搜索与爬取超时必须为正数")
 CONTENT_FILTER_THRESHOLD = float(os.getenv("CONTENT_FILTER_THRESHOLD", "0.6"))
 WORD_COUNT_THRESHOLD = int(os.getenv("WORD_COUNT_THRESHOLD", "10"))
 

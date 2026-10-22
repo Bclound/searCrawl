@@ -1,0 +1,9 @@
+use_default_settings: true
+server:
+  secret_key: __SEARCRAWL_SECRET__
+  limiter: false
+  image_proxy: false
+search:
+  formats:
+    - html
+    - json

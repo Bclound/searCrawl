@@ -7,14 +7,16 @@ It encapsulates the AsyncWebCrawler from crawl4ai library and provides
 high-level methods for crawling web pages and processing their content.
 """
 
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any
+import asyncio
+import socket
+from urllib.parse import urlencode
 from crawl4ai import (
     AsyncWebCrawler,
     BrowserConfig,
     CrawlerRunConfig,
     CacheMode,
-    CrawlerMonitor,
-    DisplayMode
+    SemaphoreDispatcher
 )
 from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
 from crawl4ai.content_filter_strategy import PruningContentFilter
@@ -22,7 +24,6 @@ import markdown
 from bs4 import BeautifulSoup
 import re
 import http.client
-from codecs import encode
 import json
 from fastapi import HTTPException
 
@@ -34,7 +35,9 @@ from config import (
     DISABLED_ENGINES,
     ENABLED_ENGINES,
     CONTENT_FILTER_THRESHOLD,
-    WORD_COUNT_THRESHOLD
+    WORD_COUNT_THRESHOLD,
+    SEARCH_TIMEOUT_SECONDS,
+    CRAWL_TIMEOUT_SECONDS
 )
 import logger
 
@@ -55,13 +58,15 @@ class WebCrawler:
         # 配置浏览器
         browser_config = BrowserConfig(headless=True, verbose=True)
         # 初始化爬虫
-        self.crawler = await AsyncWebCrawler(config=browser_config).__aenter__()
+        self.crawler = AsyncWebCrawler(config=browser_config)
+        await self.crawler.__aenter__()
         logger.info("AsyncWebCrawler初始化完成")
 
     async def close(self) -> None:
         """关闭爬虫实例，释放资源"""
         if self.crawler:
             await self.crawler.__aexit__(None, None, None)
+            self.crawler = None
             logger.info("AsyncWebCrawler已关闭")
 
     @staticmethod
@@ -122,199 +127,112 @@ class WebCrawler:
     def make_searxng_request(query: str, limit: int = 10,
                            disabled_engines: str = DISABLED_ENGINES,
                            enabled_engines: str = ENABLED_ENGINES) -> dict:
-        """向SearXNG发送搜索请求
-
-        Args:
-            query: 搜索查询字符串
-            limit: 返回结果数量限制
-            disabled_engines: 禁用的搜索引擎列表，逗号分隔
-            enabled_engines: 启用的搜索引擎列表，逗号分隔
-
-        Returns:
-            dict: SearXNG返回的搜索结果
-
-        Raises:
-            Exception: 当请求失败时抛出异常
-        """
+        """以有限超时请求 SearXNG；调用方须在线程池中执行。"""
+        conn = http.client.HTTPConnection(
+            SEARXNG_HOST, SEARXNG_PORT, timeout=SEARCH_TIMEOUT_SECONDS
+        )
         try:
-            conn = http.client.HTTPConnection(SEARXNG_HOST, SEARXNG_PORT)
-            dataList = []
-            boundary = 'wL36Yn8afVp8Ag7AmP8qZ0SA4n1v9T'
-
-            form_data = {
-                'q': query,
-                'format': 'json',
-                'language': 'zh',
-                'time_range': 'week',
-                'safesearch': '2',
-                'pageno': '1',
-                'category_general': '1'
-            }
-
-            # 添加表单字段
-            for key, value in form_data.items():
-                dataList.append(encode('--' + boundary))
-                dataList.append(encode(f'Content-Disposition: form-data; name={key};'))
-                dataList.append(encode('Content-Type: {}'.format('text/plain')))
-                dataList.append(encode(''))
-                dataList.append(encode(str(value)))
-
-            dataList.append(encode('--'+boundary+'--'))
-            dataList.append(encode(''))
-            body = b'\r\n'.join(dataList)
-
-            headers = {
-                'Cookie': f'disabled_engines={disabled_engines};enabled_engines={enabled_engines};method=POST',
-                'User-Agent': 'Sear-Crawl4AI/1.0.0',
-                'Accept': '*/*',
-                'Host': f'{SEARXNG_HOST}:{SEARXNG_PORT}',
-                'Connection': 'keep-alive',
-                'Content-Type': f'multipart/form-data; boundary={boundary}'
-            }
-
-            logger.info(f"向SearXNG发送搜索请求: {query}")
-            conn.request("POST", SEARXNG_BASE_PATH, body, headers)
-            res = conn.getresponse()
-            data = res.read()
-            return json.loads(data.decode("utf-8"))  # 解析 JSON 字符串为字典
-        except Exception as e:
-            logger.error(f"SearXNG请求失败: {str(e)}")
-            raise Exception(f"搜索请求失败: {str(e)}")
+            body = urlencode({
+                "q": query, "format": "json", "language": "zh",
+                "time_range": "week", "safesearch": "2",
+                "pageno": "1", "category_general": "1",
+            })
+            conn.request("POST", SEARXNG_BASE_PATH, body, {
+                "Cookie": f"disabled_engines={disabled_engines};enabled_engines={enabled_engines};method=POST",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": "SearCrawl/1.2.0",
+            })
+            response = conn.getresponse()
+            if response.status != 200:
+                raise HTTPException(status_code=502, detail=f"SearXNG 返回 HTTP {response.status}")
+            data = response.read(2 * 1024 * 1024 + 1)
+            if len(data) > 2 * 1024 * 1024:
+                raise HTTPException(status_code=502, detail="SearXNG 响应超过 2 MiB")
+            result = json.loads(data.decode("utf-8"))
+            if not isinstance(result, dict) or not isinstance(result.get("results"), list):
+                raise HTTPException(status_code=502, detail="SearXNG 响应缺少 results 数组")
+            return result
+        except (socket.timeout, TimeoutError):
+            raise HTTPException(status_code=504, detail="SearXNG 请求超时")
+        except (OSError, http.client.HTTPException, ValueError) as error:
+            logger.warning(f"SearXNG 请求失败: {type(error).__name__}")
+            raise HTTPException(status_code=502, detail="SearXNG 不可用或返回了无效 JSON")
+        finally:
+            conn.close()
 
     async def crawl_urls(self, urls: List[str], instruction: str) -> Dict[str, Any]:
-        """爬取多个URL并处理内容
+        """保留来源和搜索顺序，失败页面最多重试一次，并限制整批等待时间。"""
+        if not self.crawler:
+            raise HTTPException(status_code=503, detail="爬虫尚未就绪")
 
-        Args:
-            urls: 要爬取的URL列表
-            instruction: 爬取指令，通常是搜索查询
-
-        Returns:
-            Dict[str, Any]: 包含处理后内容、成功数量和失败URL的字典
-
-        Raises:
-            HTTPException: 当所有URL爬取均失败时抛出异常
-        """
-        try:
-            # 检查爬虫是否已初始化
-            if not self.crawler:
-                logger.warning("爬虫未初始化，正在自动初始化")
-                await self.initialize()
-
-            # 配置Markdown生成器
-            md_generator = DefaultMarkdownGenerator(
+        run_config = CrawlerRunConfig(
+            word_count_threshold=WORD_COUNT_THRESHOLD,
+            exclude_external_links=True,
+            remove_overlay_elements=True,
+            excluded_tags=['img', 'header', 'footer', 'iframe', 'nav'],
+            process_iframes=True,
+            markdown_generator=DefaultMarkdownGenerator(
                 content_filter=PruningContentFilter(threshold=CONTENT_FILTER_THRESHOLD),
-                options={
-                    "ignore_links": True,
-                    "ignore_images": True,
-                    "escape_html": False,
+                options={"ignore_links": True, "ignore_images": True, "escape_html": False},
+            ),
+            cache_mode=CacheMode.BYPASS,
+            page_timeout=30000,
+        )
+        urls = list(dict.fromkeys(urls))
+        pending = urls
+        pages = {}
+        deadline = asyncio.get_running_loop().time() + CRAWL_TIMEOUT_SECONDS
+        timed_out = False
+        for attempt in range(2):
+            if not pending:
+                break
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                timed_out = True
+                break
+            try:
+                results = await asyncio.wait_for(
+                    self.crawler.arun_many(
+                        urls=pending, config=run_config,
+                        dispatcher=SemaphoreDispatcher(semaphore_count=5),
+                    ),
+                    timeout=remaining,
+                )
+            except TimeoutError:
+                timed_out = True
+                break
+            except Exception:
+                logger.warning(f"第 {attempt + 1} 次批量爬取失败", exc_info=True)
+                continue
+            for result in results:
+                url = getattr(result, "url", None)
+                if url not in pending or not getattr(result, "success", False):
+                    continue
+                markdown_result = getattr(result, "markdown", None)
+                markdown_text = getattr(markdown_result, "fit_markdown", None)
+                if not isinstance(markdown_text, str) or not markdown_text.strip():
+                    markdown_text = getattr(markdown_result, "raw_markdown", None)
+                if not isinstance(markdown_text, str) or not markdown_text.strip():
+                    continue
+                metadata = getattr(result, "metadata", None) or {}
+                title = metadata.get("title", "") if isinstance(metadata, dict) else ""
+                pages[url] = {
+                    "url": url,
+                    "title": title if isinstance(title, str) else "",
+                    "markdown": markdown_text,
+                    "content": self.markdown_to_text(markdown_text),
                 }
-            )
+            pending = [url for url in urls if url not in pages]
 
-            # 配置爬虫运行参数
-            run_config = CrawlerRunConfig(
-                word_count_threshold=WORD_COUNT_THRESHOLD,
-                exclude_external_links=True,    # 移除外部链接
-                remove_overlay_elements=True,   # 移除弹窗/模态框
-                excluded_tags=['img', 'header', 'footer', 'iframe', 'nav'],      # 排除图片标签
-                process_iframes=True,           # 处理iframe
-                markdown_generator=md_generator,
-                cache_mode=CacheMode.BYPASS     # 不使用缓存
-            )
-
-            logger.info(f"开始爬取URLs: {', '.join(urls)}")
-            results = await self.crawler.arun_many(urls=urls, config=run_config)
-
-            # 创建一个列表来存储所有成功URL的爬取结果
-            all_results = []
-            failed_urls = []
-            retry_urls = []
-
-            # 第一次爬取处理
-            for i, result in enumerate(results):
-                try:
-                    if result is None:
-                        logger.debug(f"URL爬取结果为None: {urls[i]}")
-                        retry_urls.append(urls[i])
-                        continue
-
-                    if not hasattr(result, 'success'):
-                        logger.debug(f"URL爬取结果缺少success属性: {urls[i]}")
-                        retry_urls.append(urls[i])
-                        continue
-
-                    if result.success:
-                        if not hasattr(result, 'markdown') or not hasattr(result.markdown, 'fit_markdown'):
-                            logger.debug(f"URL爬取结果缺少markdown内容: {urls[i]}")
-                            retry_urls.append(urls[i])
-                            continue
-
-                        # 将成功的结果的markdown内容添加到列表中
-                        result_with_source = result.markdown.fit_markdown + '\n\n'
-                        all_results.append(result_with_source)
-                        logger.info(f"成功爬取URL: {urls[i]}")
-                    else:
-                        logger.debug(f"URL爬取失败: {urls[i]}")
-                        retry_urls.append(urls[i])
-                except Exception as e:
-                    # 记录需要重试的URL
-                    retry_urls.append(urls[i])
-                    error_msg = str(e)
-                    logger.warning(f"URL第一次爬取失败: {urls[i]}, 错误信息: {error_msg}")
-
-            # 如果有需要重试的URL，进行第二次爬取
-            if retry_urls:
-                logger.info(f"重试失败的URLs: {', '.join(retry_urls)}")
-                retry_results = await self.crawler.arun_many(urls=retry_urls, config=run_config)
-
-                for i, result in enumerate(retry_results):
-                    try:
-                        if result is None:
-                            logger.debug(f"重试URL爬取结果为None: {retry_urls[i]}")
-                            failed_urls.append(retry_urls[i])
-                            continue
-
-                        if not hasattr(result, 'success'):
-                            logger.debug(f"重试URL爬取结果缺少success属性: {retry_urls[i]}")
-                            failed_urls.append(retry_urls[i])
-                            continue
-
-                        if result.success:
-                            if not hasattr(result, 'markdown') or not hasattr(result.markdown, 'fit_markdown'):
-                                logger.debug(f"重试URL爬取结果缺少markdown内容: {retry_urls[i]}")
-                                failed_urls.append(retry_urls[i])
-                                continue
-
-                            # 将重试成功的结果添加到列表中
-                            result_with_source = result.markdown.fit_markdown + '\n\n'
-                            all_results.append(result_with_source)
-                            logger.info(f"重试成功爬取URL: {retry_urls[i]}")
-                        else:
-                            logger.debug(f"重试URL爬取仍然失败: {retry_urls[i]}")
-                            failed_urls.append(retry_urls[i])
-                    except Exception as e:
-                        # 记录最终失败的URL
-                        failed_urls.append(retry_urls[i])
-                        error_msg = str(e)
-                        logger.error(f"URL第二次爬取失败: {retry_urls[i]}, 错误信息: {error_msg}")
-
-            if not all_results:
-                logger.error("所有URL爬取均失败")
-                raise HTTPException(status_code=500, detail="所有URL爬取均失败")
-
-            # 将所有成功结果用分隔符连接成一个完整的字符串
-            combined_content = '\n\n==========\n\n'.join(all_results)
-
-            # 转换为纯文本
-            plain_text = self.markdown_to_text_regex(self.markdown_to_text(combined_content))
-
-            response = {
-                "content": plain_text,
-                "success_count": len(all_results),
-                "failed_urls": failed_urls
-            }
-
-            logger.info(f"爬取完成，成功: {len(all_results)}，失败: {len(failed_urls)}")
-            return response
-        except Exception as e:
-            logger.error(f"爬取过程发生异常: {str(e)}")
-            raise HTTPException(status_code=500, detail=str(e))
+        if not pages:
+            if timed_out:
+                raise HTTPException(status_code=504, detail="网页爬取超时")
+            raise HTTPException(status_code=502, detail="所有 URL 均未能提取有效正文")
+        results = [pages[url] for url in urls if url in pages]
+        combined = '\n\n==========\n\n'.join(result["markdown"] + '\n\n' for result in results)
+        return {
+            "content": self.markdown_to_text_regex(self.markdown_to_text(combined)),
+            "success_count": len(results),
+            "failed_urls": [url for url in urls if url not in pages],
+            "results": results,
+        }

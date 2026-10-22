@@ -1,0 +1,5 @@
+.venv/
+.env
+__pycache__/
+*.py[cod]
+.crawl4ai/
